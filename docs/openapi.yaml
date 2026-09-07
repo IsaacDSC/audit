@@ -1,0 +1,288 @@
+openapi: 3.1.0
+
+info:
+  title: Audit Service — Ingestão
+  version: "1.0.0"
+  description: |
+    Serviço de auditoria write-only (spec 001).
+
+    O serviço expõe **apenas ingestão**. Leitura/consulta de eventos, quente ou
+    fria, é responsabilidade de outro sistema (decisões 12.3 e 12.8).
+
+    A identidade do remetente vem do Basic Auth: o `username` é o `project_id`.
+    Campos derivados pelo servidor (`id`, `project_id`, `received_at`,
+    `schema_version`) são ignorados se aparecerem no body.
+  license:
+    name: MIT
+
+servers:
+  - url: https://audit.example.com
+    description: Produção
+
+security:
+  - basicAuth: []
+
+paths:
+  /v1/events:
+    post:
+      summary: Ingere um evento de auditoria
+      description: |
+        Persiste o evento no PostgreSQL de forma síncrona: o `202` só é
+        devolvido após o commit, então o evento já é durável (decisão 12.1).
+
+        **Idempotência.** Se `Idempotency-Key` for enviado, ele é usado com
+        escopo no `project_id`. Se ausente, o servidor deriva
+        `hex(sha256(project_id + "\n" + canonical_json(body)))`. Um retry com a
+        mesma chave devolve o `id` original com `202`, sem duplicar o evento.
+      operationId: ingestEvent
+      tags: [ingest]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Chave de idempotência com escopo no projeto. Ausente, é derivada do body.
+          schema:
+            type: string
+            maxLength: 256
+        - name: X-Request-ID
+          in: header
+          required: false
+          description: Propagado nos logs e devolvido na resposta. Gerado quando ausente.
+          schema:
+            type: string
+            maxLength: 128
+        - name: X-Correlation-ID
+          in: header
+          required: false
+          description: |
+            Correlação entre serviços. Se o body não trouxer `correlation_id`,
+            este header é usado; sem nenhum dos dois, cai no `request_id`.
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EventInput"
+            examples:
+              pedidoCriado:
+                summary: Pedido criado
+                value:
+                  action: order.created
+                  actor: { type: user, id: usr_123 }
+                  resource: { type: order, id: ord_456 }
+                  outcome: success
+                  occurred_at: "2026-09-07T12:00:00Z"
+                  request_id: req_abc
+                  correlation_id: corr_xyz
+                  ip: 203.0.113.10
+                  user_agent: svc-billing/1.2.0
+                  metadata:
+                    amount_cents: 1500
+                    currency: BRL
+      responses:
+        "202":
+          description: |
+            Evento aceito e já durável no PostgreSQL. Também é a resposta de um
+            retry idempotente, com o `id` do evento original.
+          headers:
+            X-Request-ID:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Accepted"
+        "400":
+          description: Body inválido ou campo obrigatório ausente.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                semAction:
+                  value:
+                    error:
+                      code: missing_field
+                      message: "campo obrigatório ausente: action"
+                    request_id: 018f...
+        "401":
+          description: Credenciais inválidas. Sem detalhes por design.
+          headers:
+            WWW-Authenticate:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: Body acima de 64 KiB (configurável).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "415":
+          description: "`Content-Type` diferente de `application/json`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          description: Rate limit por `project_id` excedido.
+          headers:
+            Retry-After:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: PostgreSQL ou store de credenciais indisponível.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /healthz:
+    get:
+      summary: Liveness
+      operationId: liveness
+      tags: [ops]
+      security: []
+      responses:
+        "200":
+          description: Processo vivo.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+
+  /readyz:
+    get:
+      summary: Readiness
+      operationId: readiness
+      tags: [ops]
+      security: []
+      responses:
+        "200":
+          description: Dependências utilizáveis.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "503":
+          description: Dependências indisponíveis.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: "`username` = `project_id`; `password` = segredo do serviço."
+
+  schemas:
+    EventInput:
+      type: object
+      required: [action, occurred_at]
+      additionalProperties: true
+      description: |
+        Campos não listados aqui são preservados em `extensions`, exceto os
+        derivados pelo servidor, que são descartados.
+      properties:
+        action:
+          type: string
+          maxLength: 256
+          examples: [order.created]
+        occurred_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339. Não pode estar mais de 24h no futuro nem antes da janela
+            quente de 90 dias (a partição correspondente já teria sido
+            arquivada).
+        actor:
+          $ref: "#/components/schemas/Ref"
+        resource:
+          $ref: "#/components/schemas/Ref"
+        outcome:
+          type: string
+          maxLength: 64
+          examples: [success, failure]
+        request_id:
+          type: string
+          maxLength: 256
+        correlation_id:
+          type: string
+          maxLength: 256
+        ip:
+          type: string
+          description: Endereço IPv4 ou IPv6.
+          examples: ["203.0.113.10"]
+        user_agent:
+          type: string
+          maxLength: 512
+        metadata:
+          type: object
+          maxProperties: 20
+          additionalProperties: true
+          description: |
+            Máximo de 4 KiB e 20 chaves. Chaves da allowlist global vão para a
+            coluna `metadata`; as demais são preservadas em
+            `extensions.metadata`.
+
+    Ref:
+      type: object
+      properties:
+        type: { type: string, maxLength: 128 }
+        id: { type: string, maxLength: 256 }
+
+    Accepted:
+      type: object
+      required: [id, received_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        received_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Código estável para automação.
+              enum:
+                - empty_body
+                - invalid_json
+                - invalid_body
+                - missing_field
+                - invalid_field
+                - occurred_at_in_future
+                - occurred_at_too_old
+                - metadata_too_many_keys
+                - metadata_too_large
+                - idempotency_key_too_long
+                - unsupported_media_type
+                - unreadable_body
+                - body_too_large
+                - unauthorized
+                - rate_limited
+                - auth_unavailable
+                - storage_unavailable
+                - internal_error
+                - not_ready
+            message:
+              type: string
+              description: Mensagem segura, sem segredo nem PII do body.
+        request_id:
+          type: string
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          examples: [ok]

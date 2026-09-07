@@ -1,0 +1,318 @@
+# Azure Pipelines — audit service
+# Stages: test → race → build/push ACR → deploy API (Container App) → deploy migrate (Container Apps Job)
+#
+# Variable group / pipeline variables expected:
+#   ACR_NAME, ACR_LOGIN_SERVER
+#   AZURE_SERVICE_CONNECTION          # ARM service connection
+#   RESOURCE_GROUP
+#   CONTAINER_APP_ENV                 # Container Apps Environment name
+#   CONTAINER_APP_API_NAME            # e.g. audit-api
+#   CONTAINER_APP_JOB_NAME            # e.g. audit-migrate
+#   MIGRATE_CRON                      # e.g. "0 3 * * *" (03:00 UTC diário)
+# Optional: IMAGE_REPOSITORY (default: audit)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - docs/**
+      - LICENSE
+      - README.md
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  GO_VERSION: "1.26.1"
+  IMAGE_REPOSITORY: audit
+  IMAGE_TAG: $(Build.SourceVersion)
+
+stages:
+  # ---------------------------------------------------------------------------
+  # 1) Testes unitários / integração + vet
+  # ---------------------------------------------------------------------------
+  - stage: Test
+    displayName: Testes e validação
+    jobs:
+      - job: GoTest
+        displayName: go test / vet / tidy
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: GoTool@0
+            displayName: Instalar Go $(GO_VERSION)
+            inputs:
+              version: $(GO_VERSION)
+
+          # Os testes de integração de `internal/store/postgres` exercitam o
+          # SQL de verdade (particionamento semanal, jsonb/inet, idempotência,
+          # DETACH/DROP). Sem AUDIT_TEST_DATABASE_URL eles são pulados.
+          - script: |
+              set -euo pipefail
+              docker run -d --name audit-pg \
+                -e POSTGRES_USER=audit \
+                -e POSTGRES_PASSWORD=audit \
+                -e POSTGRES_DB=audit \
+                -p 5432:5432 \
+                postgres:16-alpine
+              for i in $(seq 1 30); do
+                if docker exec audit-pg pg_isready -U audit -d audit >/dev/null 2>&1; then
+                  echo "PostgreSQL pronto"; exit 0
+                fi
+                sleep 1
+              done
+              echo "PostgreSQL não ficou pronto a tempo" >&2
+              exit 1
+            displayName: Subir PostgreSQL para testes de integração
+
+          - script: |
+              set -euo pipefail
+              go version
+              go mod download
+              go mod verify
+              go vet ./...
+              go test ./... -count=1 -timeout 10m
+            displayName: go vet + go test
+            workingDirectory: $(Build.SourcesDirectory)
+            env:
+              AUDIT_TEST_DATABASE_URL: postgres://audit:audit@localhost:5432/audit?sslmode=disable
+
+          - script: docker rm -f audit-pg || true
+            displayName: Derrubar PostgreSQL
+            condition: always()
+
+  # ---------------------------------------------------------------------------
+  # 2) Race detector (detecção de data races)
+  # ---------------------------------------------------------------------------
+  - stage: Race
+    displayName: Validação de race condition
+    dependsOn: Test
+    jobs:
+      - job: GoRace
+        displayName: go test -race
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: GoTool@0
+            displayName: Instalar Go $(GO_VERSION)
+            inputs:
+              version: $(GO_VERSION)
+
+          - script: |
+              set -euo pipefail
+              docker run -d --name audit-pg-race \
+                -e POSTGRES_USER=audit \
+                -e POSTGRES_PASSWORD=audit \
+                -e POSTGRES_DB=audit \
+                -p 5432:5432 \
+                postgres:16-alpine
+              for i in $(seq 1 30); do
+                if docker exec audit-pg-race pg_isready -U audit -d audit >/dev/null 2>&1; then
+                  echo "PostgreSQL pronto"; exit 0
+                fi
+                sleep 1
+              done
+              echo "PostgreSQL não ficou pronto a tempo" >&2
+              exit 1
+            displayName: Subir PostgreSQL para testes de integração
+
+          - script: |
+              set -euo pipefail
+              # CGO necessário para o race detector
+              export CGO_ENABLED=1
+              go test ./... -race -count=1 -timeout 20m
+            displayName: go test -race
+            workingDirectory: $(Build.SourcesDirectory)
+            env:
+              AUDIT_TEST_DATABASE_URL: postgres://audit:audit@localhost:5432/audit?sslmode=disable
+
+          - script: docker rm -f audit-pg-race || true
+            displayName: Derrubar PostgreSQL
+            condition: always()
+
+  # ---------------------------------------------------------------------------
+  # 3) Build imagem + push ACR
+  # ---------------------------------------------------------------------------
+  - stage: BuildPush
+    displayName: Build e push ACR
+    dependsOn:
+      - Test
+      - Race
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: DockerACR
+        displayName: docker build & push
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: ACR login + build + push
+            inputs:
+              azureSubscription: $(AZURE_SERVICE_CONNECTION)
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: $(Build.SourcesDirectory)
+              inlineScript: |
+                set -euo pipefail
+
+                : "${ACR_NAME:?ACR_NAME required}"
+                : "${ACR_LOGIN_SERVER:?ACR_LOGIN_SERVER required}"
+
+                IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+                IMAGE_LATEST="${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:latest"
+
+                echo "Building ${IMAGE}"
+
+                az acr login --name "${ACR_NAME}"
+
+                docker build \
+                  --pull \
+                  -t "${IMAGE}" \
+                  -t "${IMAGE_LATEST}" \
+                  -f Dockerfile \
+                  .
+
+                docker push "${IMAGE}"
+                docker push "${IMAGE_LATEST}"
+
+                echo "Pushed ${IMAGE}"
+            name: BuildPush
+
+  # ---------------------------------------------------------------------------
+  # 4) Deploy API → Azure Container Apps (app)
+  # ---------------------------------------------------------------------------
+  - stage: DeployAPI
+    displayName: Deploy API (Container Apps)
+    dependsOn: BuildPush
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployContainerApp
+        displayName: containerapp update (args: api)
+        environment: audit-production
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: Atualizar Container App (api)
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      : "${RESOURCE_GROUP:?}"
+                      : "${CONTAINER_APP_API_NAME:?}"
+                      : "${CONTAINER_APP_ENV:?}"
+                      : "${ACR_LOGIN_SERVER:?}"
+
+                      FULL_IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+                      if az containerapp show \
+                          --name "${CONTAINER_APP_API_NAME}" \
+                          --resource-group "${RESOURCE_GROUP}" &>/dev/null; then
+                        echo "Updating existing Container App ${CONTAINER_APP_API_NAME}"
+                        az containerapp update \
+                          --name "${CONTAINER_APP_API_NAME}" \
+                          --resource-group "${RESOURCE_GROUP}" \
+                          --image "${FULL_IMAGE}" \
+                          --args "api"
+                      else
+                        echo "Creating Container App ${CONTAINER_APP_API_NAME}"
+                        az containerapp create \
+                          --name "${CONTAINER_APP_API_NAME}" \
+                          --resource-group "${RESOURCE_GROUP}" \
+                          --environment "${CONTAINER_APP_ENV}" \
+                          --image "${FULL_IMAGE}" \
+                          --ingress external \
+                          --target-port 8080 \
+                          --min-replicas 1 \
+                          --max-replicas 10 \
+                          --cpu 0.5 --memory 1.0Gi \
+                          --registry-server "${ACR_LOGIN_SERVER}" \
+                          --args "api"
+                      fi
+
+                      FQDN=$(az containerapp show \
+                        --name "${CONTAINER_APP_API_NAME}" \
+                        --resource-group "${RESOURCE_GROUP}" \
+                        --query properties.configuration.ingress.fqdn -o tsv)
+                      echo "API FQDN: https://${FQDN}"
+                      echo "Image: ${FULL_IMAGE}"
+
+  # ---------------------------------------------------------------------------
+  # 5) Deploy Job agendado → Azure Container Apps Jobs
+  # ---------------------------------------------------------------------------
+  - stage: DeployJob
+    displayName: Deploy migrate (Container Apps Job)
+    dependsOn: BuildPush
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployContainerAppJob
+        displayName: containerapp job update (args: migrate)
+        environment: audit-production
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: Atualizar Container Apps Job (migrate)
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      : "${RESOURCE_GROUP:?}"
+                      : "${CONTAINER_APP_JOB_NAME:?}"
+                      : "${CONTAINER_APP_ENV:?}"
+                      : "${ACR_LOGIN_SERVER:?}"
+                      MIGRATE_CRON="${MIGRATE_CRON:-0 3 * * *}"
+
+                      FULL_IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+                      # Job agendado: mesma imagem ACR, arg "migrate" (roda e encerra)
+                      if az containerapp job show \
+                          --name "${CONTAINER_APP_JOB_NAME}" \
+                          --resource-group "${RESOURCE_GROUP}" &>/dev/null; then
+                        echo "Updating Container Apps Job ${CONTAINER_APP_JOB_NAME}"
+                        az containerapp job update \
+                          --name "${CONTAINER_APP_JOB_NAME}" \
+                          --resource-group "${RESOURCE_GROUP}" \
+                          --image "${FULL_IMAGE}" \
+                          --args "migrate" \
+                          --cron-expression "${MIGRATE_CRON}"
+                      else
+                        echo "Creating scheduled Container Apps Job ${CONTAINER_APP_JOB_NAME}"
+                        az containerapp job create \
+                          --name "${CONTAINER_APP_JOB_NAME}" \
+                          --resource-group "${RESOURCE_GROUP}" \
+                          --environment "${CONTAINER_APP_ENV}" \
+                          --trigger-type Schedule \
+                          --cron-expression "${MIGRATE_CRON}" \
+                          --image "${FULL_IMAGE}" \
+                          --cpu 0.5 --memory 1.0Gi \
+                          --replica-timeout 3600 \
+                          --replica-retry-limit 1 \
+                          --parallelism 1 \
+                          --replica-completion-count 1 \
+                          --registry-server "${ACR_LOGIN_SERVER}" \
+                          --args "migrate"
+                      fi
+
+                      echo "Job ${CONTAINER_APP_JOB_NAME} schedule: ${MIGRATE_CRON}"
+                      echo "Image: ${FULL_IMAGE}"

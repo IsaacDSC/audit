@@ -1,0 +1,28 @@
+# Collector do stack local: recebe OTLP da API e do job e imprime as métricas
+# no stdout. Em produção o destino é o Elastic (decisão 12.9); aqui o objetivo
+# é só conferir que os instrumentos da seção 11 estão sendo emitidos.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

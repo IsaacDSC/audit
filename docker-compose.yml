@@ -1,0 +1,146 @@
+# Stack local de desenvolvimento do serviço de auditoria.
+#
+#   docker compose up -d --build      sobe PostgreSQL, MinIO, collector e a API
+#   docker compose run --rm migrate   roda uma passada do arquivamento
+#   docker compose down -v            derruba tudo e apaga os volumes
+#
+# Não use este arquivo em produção: as credenciais são fixas e conhecidas, e a
+# janela quente do `migrate` é encurtada para 1h (ver comentário no serviço).
+#
+# Exemplos de request em requests.md.
+
+name: audit
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: audit
+      POSTGRES_PASSWORD: audit
+      POSTGRES_DB: audit
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audit -d audit"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # MINIO_KMS_SECRET_KEY habilita o SSE-KMS que o modo `migrate` exige
+  # (decisão 12.7). `audit-cmk` faz o papel da CMK.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_KMS_SECRET_KEY: "audit-cmk:bDBSTzZQZjdWNWJDNmpVTDlmSFZ3RTNxWXNCbjdLZGE="
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/audit-cold &&
+        echo 'bucket audit-cold pronto'
+      "
+
+  # Recebe as métricas OTLP e imprime no stdout. Em produção o endpoint é o
+  # Elastic (decisão 12.9); aqui o collector serve para conferir os
+  # instrumentos com `docker compose logs otel-collector`.
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "${OTLP_GRPC_PORT:-4317}:4317"
+
+  api:
+    build:
+      context: .
+      args:
+        VERSION: local
+    command: ["api"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8080}:8080"
+    restart: on-failure:3
+    environment:
+      DATABASE_URL: postgres://audit:audit@postgres:5432/audit?sslmode=disable
+      AUDIT_ENV: local
+      LOG_LEVEL: info
+
+      # Hashes bcrypt de `s3cr3t` para os dois projetos. O `$` é escapado como
+      # `$$` para o Compose não tentar interpolar o hash.
+      AUDIT_CREDENTIALS: "billing:$$2a$$10$$WCaf/ptIoQy7jPFFMu1MX.dexIxpSCyDNqewPAFfqJ5.Sfjhkj1jy,checkout:$$2a$$10$$6hjDhGpPvwPpnMqlvv0.leS.ACHgsEckyPwaFksMCtGa8rFYNBMS."
+
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_METRIC_EXPORT_INTERVAL: "10000" # ms, conforme a spec do OTel
+
+      # Limite baixo para facilitar o teste de 429 (requests.md).
+      RATE_LIMIT_RPS: "${RATE_LIMIT_RPS:-100}"
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-200}"
+
+  # Job batch: roda uma passada e encerra. Fica em um profile para não subir
+  # junto com `docker compose up`.
+  #
+  # HOT_RETENTION=1h só para desenvolvimento: com os 90 dias de produção
+  # nenhuma partição ficaria elegível em um ambiente recém-criado. Ainda assim
+  # é preciso ingerir eventos de uma semana ISO anterior, porque a unidade de
+  # arquivamento é a partição semanal fechada (ver requests.md).
+  migrate:
+    build:
+      context: .
+      args:
+        VERSION: local
+    command: ["migrate"]
+    profiles: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://audit:audit@postgres:5432/audit?sslmode=disable
+      AUDIT_ENV: local
+      LOG_LEVEL: info
+
+      HOT_RETENTION: "${HOT_RETENTION:-1h}"
+      ARCHIVE_BATCH_ROWS: "${ARCHIVE_BATCH_ROWS:-2}"
+
+      COLD_STORAGE_PROVIDER: s3
+      COLD_STORAGE_BUCKET: audit-cold
+      COLD_STORAGE_PREFIX: audit
+      COLD_STORAGE_KMS_KEY_ID: audit-cmk
+      COLD_STORAGE_S3_ENDPOINT: http://minio:9000
+      COLD_STORAGE_S3_PATH_STYLE: "true"
+
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+
+volumes:
+  postgres-data:
+  minio-data:
